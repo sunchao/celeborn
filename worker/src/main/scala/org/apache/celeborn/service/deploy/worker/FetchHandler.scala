@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.function.Consumer
 
 import com.google.common.base.Throwables
+import com.google.common.collect.MapMaker
 import com.google.protobuf.GeneratedMessageV3
 import io.netty.util.concurrent.{Future, GenericFutureListener}
 
@@ -60,6 +61,15 @@ class FetchHandler(
   var storageManager: StorageManager = _
   var partitionsSorter: PartitionFilesSorter = _
   var registered: Option[AtomicBoolean] = None
+
+  private class ShuffleReadState {
+    var expired = false
+  }
+
+  // Requests retain their gate until response construction finishes. Weak values also let gates
+  // for failed lookups disappear without retaining shuffle keys that will never be cleaned up.
+  private val shuffleReadStates =
+    new MapMaker().weakValues().makeMap[String, ShuffleReadState]()
 
   def init(worker: Worker): Unit = {
     workerSource.addGauge(WorkerSource.ACTIVE_CHUNK_STREAM_COUNT) { () =>
@@ -165,6 +175,7 @@ class FetchHandler(
           client.getChannel.id().toString,
           rpcRequest.requestId)
         workerSource.startTimer(WorkerSource.OPEN_STREAM_TIME, openStreamRequestId)
+        val shuffleReadState = getShuffleReadState(shuffleKey)
         val streamHandlerFutures = (0 until files.size()).map { idx =>
           handleReduceOpenStreamAsync(
             client,
@@ -172,7 +183,8 @@ class FetchHandler(
             files.get(idx),
             startIndices.get(idx),
             endIndices.get(idx),
-            readLocalFlags.get(idx))
+            readLocalFlags.get(idx),
+            shuffleReadState)
         }
         CompletableFuture
           .allOf(streamHandlerFutures: _*)
@@ -273,13 +285,29 @@ class FetchHandler(
 
   }
 
+  private def getShuffleReadState(shuffleKey: String): ShuffleReadState = {
+    shuffleReadStates.computeIfAbsent(shuffleKey, _ => new ShuffleReadState)
+  }
+
+  private def withActiveShuffleRead[T](
+      shuffleKey: String,
+      shuffleReadState: ShuffleReadState)(body: => T): T = {
+    shuffleReadState.synchronized {
+      if (shuffleReadState.expired) {
+        throw new IOException(s"Shuffle key $shuffleKey expired while opening a stream.")
+      }
+      body
+    }
+  }
+
   private def handleReduceOpenStreamAsync(
       client: TransportClient,
       shuffleKey: String,
       fileName: String,
       startIndex: Int,
       endIndex: Int,
-      readLocalShuffle: Boolean = false): CompletableFuture[PbStreamHandlerOpt] = {
+      readLocalShuffle: Boolean,
+      shuffleReadState: ShuffleReadState): CompletableFuture[PbStreamHandlerOpt] = {
     try {
       logDebug(s"Received open stream request $shuffleKey $fileName $startIndex " +
         s"$endIndex get file name $fileName from client channel " +
@@ -291,18 +319,27 @@ class FetchHandler(
       // 1. when the current request is a non-range openStream, but the original unsorted file
       //    has been deleted by another range's openStream request.
       // 2. when the current request is a range openStream request.
-      if ((endIndex != Int.MaxValue && endIndex != -1 && endIndex >= startIndex) ||
-        (endIndex == Int.MaxValue && !fileInfo.addStream(streamId))) {
-        partitionsSorter
-          .getSortedFileInfoAsync(shuffleKey, fileName, fileInfo, startIndex, endIndex)
-          .handle[PbStreamHandlerOpt] { (sortedFileInfo, error) =>
-            if (error != null) {
-              buildReduceOpenStreamFailure(
-                client,
-                shuffleKey,
-                fileName,
-                Throwables.getRootCause(error))
-            } else {
+      val fileInfoFuture = withActiveShuffleRead(shuffleKey, shuffleReadState) {
+        if ((endIndex != Int.MaxValue && endIndex != -1 && endIndex >= startIndex) ||
+          (endIndex == Int.MaxValue && !fileInfo.addStream(streamId))) {
+          partitionsSorter
+            .getSortedFileInfoAsync(shuffleKey, fileName, fileInfo, startIndex, endIndex)
+        } else {
+          CompletableFuture.completedFuture(fileInfo)
+        }
+      }
+      // Attach callbacks outside the admission gate: an already-completed future may invoke them
+      // inline. Only local response construction and stream registration need the gate below.
+      fileInfoFuture.handle[PbStreamHandlerOpt] { (readyFileInfo, error) =>
+        if (error != null) {
+          buildReduceOpenStreamFailure(
+            client,
+            shuffleKey,
+            fileName,
+            Throwables.getRootCause(error))
+        } else {
+          try {
+            withActiveShuffleRead(shuffleKey, shuffleReadState) {
               buildReduceOpenStreamResponse(
                 client,
                 shuffleKey,
@@ -311,20 +348,16 @@ class FetchHandler(
                 endIndex,
                 readLocalShuffle,
                 streamId,
-                sortedFileInfo)
+                readyFileInfo)
             }
+          } catch {
+            case e: IOException =>
+              if (endIndex == Int.MaxValue && (readyFileInfo eq fileInfo)) {
+                fileInfo.closeStream(streamId)
+              }
+              buildReduceOpenStreamFailure(client, shuffleKey, fileName, e)
           }
-      } else {
-        CompletableFuture.completedFuture(
-          buildReduceOpenStreamResponse(
-            client,
-            shuffleKey,
-            fileName,
-            startIndex,
-            endIndex,
-            readLocalShuffle,
-            streamId,
-            fileInfo))
+        }
       }
     } catch {
       case e: IOException =>
@@ -449,6 +482,7 @@ class FetchHandler(
       rpcRequestId)
     workerSource.startTimer(WorkerSource.OPEN_STREAM_TIME, requestId)
     try {
+      val shuffleReadState = getShuffleReadState(shuffleKey)
       val fileInfo = getRawFileInfo(shuffleKey, fileName)
       fileInfo.getFileMeta match {
         case _: ReduceFileMeta =>
@@ -458,7 +492,8 @@ class FetchHandler(
             fileName,
             startIndex,
             endIndex,
-            readLocalShuffle)
+            readLocalShuffle,
+            shuffleReadState)
             .whenComplete { (pbStreamHandlerOpt, error) =>
               workerSource.stopTimer(WorkerSource.OPEN_STREAM_TIME, requestId)
               if (error != null) {
@@ -757,6 +792,15 @@ class FetchHandler(
   }
 
   def cleanupExpiredShuffleKey(expiredShuffleKeys: util.HashSet[String]): Unit = {
+    expiredShuffleKeys.forEach { shuffleKey =>
+      val shuffleReadState = shuffleReadStates.get(shuffleKey)
+      if (shuffleReadState != null) {
+        shuffleReadState.synchronized {
+          shuffleReadState.expired = true
+          shuffleReadStates.remove(shuffleKey, shuffleReadState)
+        }
+      }
+    }
     chunkStreamManager.cleanupExpiredShuffleKey(expiredShuffleKeys)
     // maybe null when running unit test.
     if (partitionsSorter != null) {

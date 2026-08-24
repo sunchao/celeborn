@@ -23,23 +23,31 @@ import static org.mockito.Mockito.*;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.common.base.Throwables;
+import com.google.common.cache.Cache;
 import io.netty.channel.Channel;
 import io.netty.channel.embedded.EmbeddedChannel;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -51,6 +59,7 @@ import org.apache.celeborn.common.CelebornConf;
 import org.apache.celeborn.common.identity.UserIdentifier;
 import org.apache.celeborn.common.meta.DiskFileInfo;
 import org.apache.celeborn.common.meta.FileInfo;
+import org.apache.celeborn.common.meta.ReduceFileMeta;
 import org.apache.celeborn.common.network.buffer.NioManagedBuffer;
 import org.apache.celeborn.common.network.client.RpcResponseCallback;
 import org.apache.celeborn.common.network.client.TransportClient;
@@ -72,10 +81,13 @@ import org.apache.celeborn.common.protocol.PbOpenStreamList;
 import org.apache.celeborn.common.protocol.PbOpenStreamListResponse;
 import org.apache.celeborn.common.protocol.PbStreamChunkSlice;
 import org.apache.celeborn.common.protocol.PbStreamHandler;
+import org.apache.celeborn.common.protocol.StorageInfo;
 import org.apache.celeborn.common.protocol.StreamType;
 import org.apache.celeborn.common.protocol.TransportModuleConstants;
 import org.apache.celeborn.common.unsafe.Platform;
+import org.apache.celeborn.common.util.CelebornExitKind;
 import org.apache.celeborn.common.util.JavaUtils;
+import org.apache.celeborn.common.util.ShuffleBlockInfoUtils.ShuffleBlockInfo;
 import org.apache.celeborn.common.util.Utils;
 import org.apache.celeborn.service.deploy.worker.memory.MemoryManager;
 import org.apache.celeborn.service.deploy.worker.storage.PartitionFilesSorter;
@@ -506,14 +518,271 @@ public class FetchHandlerSuiteJ {
     }
   }
 
+  @Test
+  public void testCleanupFailsPendingResolveWithoutRecreatingCacheOrStream() throws Exception {
+    FileInfo fileInfo = null;
+    PartitionFilesSorter sorter = null;
+    FetchHandler fetchHandler = null;
+    EmbeddedChannel channel = new EmbeddedChannel();
+    CountDownLatch indexRead = new CountDownLatch(1);
+    CountDownLatch allowIndexPublication = new CountDownLatch(1);
+    HashSet<String> expiredShuffleKeys = new HashSet<>(Collections.singleton(shuffleKey));
+    try {
+      fileInfo = prepare(1);
+      CelebornConf sorterConf = new CelebornConf();
+      sorterConf.set(CelebornConf.WORKER_PARTITION_SORTER_RESOLVE_THREADS().key(), "1");
+      sorter =
+          new PartitionFilesSorter(MemoryManager.instance(), sorterConf, mock(WorkerSource.class)) {
+            @Override
+            protected Map<Integer, List<ShuffleBlockInfo>> readIndex(String indexFilePath)
+                throws IOException {
+              Map<Integer, List<ShuffleBlockInfo>> indexes = super.readIndex(indexFilePath);
+              indexRead.countDown();
+              try {
+                assertTrue(
+                    "Index reader was never released",
+                    allowIndexPublication.await(30, TimeUnit.SECONDS));
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while holding the resolver", e);
+              }
+              return indexes;
+            }
+          };
+      fetchHandler = mockFetchHandler(fileInfo, sorter);
+      TransportClient client = new TransportClient(channel, mock(TransportResponseHandler.class));
+      Map<?, ?> indexCacheNames = getSorterField(sorter, "indexCacheNames", Map.class);
+      Cache<?, ?> indexCache = getSorterField(sorter, "indexCache", Cache.class);
+      ExecutorService resolverExecutor =
+          getSorterField(sorter, "sortedFileResolveExecutors", ExecutorService.class);
+      String fileId = shuffleKey + "-" + fileName;
+      receiveRangeOpenStream(fetchHandler, client);
+
+      assertTrue("Resolver did not read the index", indexRead.await(10, TimeUnit.SECONDS));
+      assertEquals(1, sorter.getSortedFileWaiterCount());
+      assertNull(channel.readOutbound());
+
+      // Worker.cleanup performs these in this order, then schedules physical storage cleanup.
+      // Keep the files until finally to model that storage-cleanup task not having run yet.
+      fetchHandler.cleanupExpiredShuffleKey(expiredShuffleKeys);
+      sorter.cleanup(expiredShuffleKeys);
+      assertEquals(0, sorter.getSortedFileWaiterCount());
+      assertTrue(waitForOutbound(channel) instanceof RpcFailure);
+      assertEquals(0, fetchHandler.chunkStreamManager().getStreamsCount());
+      assertFalse(indexCacheNames.containsKey(shuffleKey));
+      assertFalse(indexCache.asMap().containsKey(fileId));
+
+      // Drain the single resolver after releasing it, without closing the sorter and clearing its
+      // cache. An already-failed request must not hide late cache or stream publication.
+      Future<?> resolveFinished = resolverExecutor.submit(() -> {});
+      allowIndexPublication.countDown();
+      resolveFinished.get(10, TimeUnit.SECONDS);
+      assertFalse(indexCacheNames.containsKey(shuffleKey));
+      assertFalse(indexCache.asMap().containsKey(fileId));
+      assertEquals(0, fetchHandler.chunkStreamManager().getStreamsCount());
+      assertNull(channel.readOutbound());
+    } finally {
+      allowIndexPublication.countDown();
+      try {
+        if (sorter != null) {
+          sorter.close(CelebornExitKind.WORKER_GRACEFUL_SHUTDOWN());
+        }
+      } finally {
+        if (fetchHandler != null) {
+          fetchHandler.chunkStreamManager().cleanupExpiredShuffleKey(expiredShuffleKeys);
+        }
+        channel.finishAndReleaseAll();
+        cleanup(fileInfo);
+      }
+    }
+  }
+
+  @Test
+  public void testCleanupRejectsOpenStreamAfterFileLookup() throws Exception {
+    FileInfo fileInfo = null;
+    PartitionFilesSorter sorter = null;
+    FetchHandler fetchHandler = null;
+    EmbeddedChannel channel = new EmbeddedChannel();
+    ExecutorService requestExecutor = Executors.newSingleThreadExecutor();
+    CountDownLatch fileInfoCaptured = new CountDownLatch(1);
+    CountDownLatch allowFileLookup = new CountDownLatch(1);
+    HashSet<String> expiredShuffleKeys = new HashSet<>(Collections.singleton(shuffleKey));
+    try {
+      fileInfo = prepare(1);
+      sorter =
+          spy(new PartitionFilesSorter(MemoryManager.instance(), conf, mock(WorkerSource.class)));
+      FetchHandler handler = mockFetchHandler(fileInfo, sorter);
+      fetchHandler = handler;
+      when(handler.storageManager().getFileInfo(shuffleKey, fileName)).thenReturn(fileInfo);
+      doAnswer(
+              invocation -> {
+                FileInfo capturedFileInfo = (FileInfo) invocation.callRealMethod();
+                fileInfoCaptured.countDown();
+                try {
+                  assertTrue(
+                      "File lookup was never released",
+                      allowFileLookup.await(30, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                  throw new IOException("Interrupted while holding file lookup", e);
+                }
+                return capturedFileInfo;
+              })
+          .when(handler)
+          .getRawFileInfo(shuffleKey, fileName);
+      TransportClient client = new TransportClient(channel, mock(TransportResponseHandler.class));
+      Future<?> receiveTask = requestExecutor.submit(() -> receiveRangeOpenStream(handler, client));
+
+      assertTrue("File lookup did not start", fileInfoCaptured.await(10, TimeUnit.SECONDS));
+      handler.cleanupExpiredShuffleKey(expiredShuffleKeys);
+      sorter.cleanup(expiredShuffleKeys);
+      // Keep returning the captured metadata until physical cleanup runs. Expiry, rather than a
+      // missing file, must prevent this old request from starting another sort.
+      allowFileLookup.countDown();
+      receiveTask.get(5, TimeUnit.SECONDS);
+      verify(sorter, never())
+          .getSortedFileInfoAsync(
+              anyString(), anyString(), any(FileInfo.class), anyInt(), anyInt());
+      assertTrue(waitForOutbound(channel) instanceof RpcFailure);
+      assertEquals(0, handler.chunkStreamManager().getStreamsCount());
+    } finally {
+      allowFileLookup.countDown();
+      requestExecutor.shutdownNow();
+      try {
+        requestExecutor.awaitTermination(5, TimeUnit.SECONDS);
+      } finally {
+        try {
+          if (sorter != null) {
+            sorter.close(CelebornExitKind.WORKER_GRACEFUL_SHUTDOWN());
+          }
+        } finally {
+          if (fetchHandler != null) {
+            fetchHandler.chunkStreamManager().cleanupExpiredShuffleKey(expiredShuffleKeys);
+          }
+          channel.finishAndReleaseAll();
+          cleanup(fileInfo);
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testDfsSorterPreparationDoesNotBlockReceiveCaller() throws Exception {
+    Map<StorageInfo.Type, FileSystem> previousFileSystems = StorageManager.hadoopFs();
+    FileSystem metadataFileSystem = mock(FileSystem.class);
+    CountDownLatch metadataEntered = new CountDownLatch(1);
+    CountDownLatch releaseMetadata = new CountDownLatch(1);
+    AtomicReference<Thread> receiveThread = new AtomicReference<>();
+    AtomicReference<Thread> metadataThread = new AtomicReference<>();
+    ExecutorService requestExecutor = Executors.newSingleThreadExecutor();
+    EmbeddedChannel channel = new EmbeddedChannel();
+    PartitionFilesSorter actualSorter = null;
+    try {
+      StorageManager.hadoopFs_$eq(
+          Collections.singletonMap(StorageInfo.Type.HDFS, metadataFileSystem));
+      when(metadataFileSystem.exists(any(Path.class)))
+          .thenAnswer(
+              invocation -> {
+                metadataThread.set(Thread.currentThread());
+                metadataEntered.countDown();
+                try {
+                  if (!releaseMetadata.await(30, TimeUnit.SECONDS)) {
+                    throw new IOException("Timed out waiting to release DFS metadata probe.");
+                  }
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                  throw new IOException("Interrupted DFS metadata probe.", e);
+                }
+                // Fail before opening any files, so the test never accesses a real DFS.
+                throw new IOException("Injected DFS metadata failure after release.");
+              });
+      DiskFileInfo fileInfo =
+          new DiskFileInfo(
+              userIdentifier,
+              true,
+              new ReduceFileMeta(conf.shuffleChunkSize()),
+              "hdfs://test.invalid/shuffle/partition",
+              StorageInfo.Type.HDFS);
+      FetchHandler fetchHandler = mockFetchHandler(fileInfo);
+      // This fixture creates a real sorter; keep and close it instead of mocking its async API.
+      actualSorter = fetchHandler.partitionsSorter();
+      TransportClient client = new TransportClient(channel, mock(TransportResponseHandler.class));
+      Future<?> receiveTask =
+          requestExecutor.submit(
+              () -> {
+                receiveThread.set(Thread.currentThread());
+                receiveRangeOpenStream(fetchHandler, client);
+              });
+
+      assertTrue("DFS metadata probe was not reached.", metadataEntered.await(5, TimeUnit.SECONDS));
+      assertNotSame(
+          "DFS exists must not run on the receive caller.",
+          receiveThread.get(),
+          metadataThread.get());
+      receiveTask.get(5, TimeUnit.SECONDS);
+      Future<?> sentinelTask = requestExecutor.submit(() -> {});
+      sentinelTask.get(5, TimeUnit.SECONDS);
+      assertNull(channel.readOutbound());
+
+      releaseMetadata.countDown();
+      assertTrue(waitForOutbound(channel) instanceof RpcFailure);
+    } finally {
+      releaseMetadata.countDown();
+      requestExecutor.shutdownNow();
+      try {
+        requestExecutor.awaitTermination(5, TimeUnit.SECONDS);
+      } finally {
+        try {
+          if (actualSorter != null) {
+            actualSorter.close(CelebornExitKind.WORKER_GRACEFUL_SHUTDOWN());
+          }
+        } finally {
+          StorageManager.hadoopFs_$eq(previousFileSystems);
+          channel.finishAndReleaseAll();
+        }
+      }
+    }
+  }
+
+  private void receiveRangeOpenStream(FetchHandler fetchHandler, TransportClient client) {
+    PbOpenStream request =
+        PbOpenStream.newBuilder()
+            .setShuffleKey(shuffleKey)
+            .setFileName(fileName)
+            .setStartIndex(5)
+            .setEndIndex(10)
+            .build();
+    fetchHandler.receive(
+        client,
+        new RpcRequest(
+            dummyRequestId,
+            new NioManagedBuffer(
+                new TransportMessage(MessageType.OPEN_STREAM, request.toByteArray())
+                    .toByteBuffer())),
+        createRpcResponseCallback(client.getChannel()));
+  }
+
+  private static <T> T getSorterField(PartitionFilesSorter sorter, String name, Class<T> fieldType)
+      throws ReflectiveOperationException {
+    Field field = PartitionFilesSorter.class.getDeclaredField(name);
+    field.setAccessible(true);
+    return fieldType.cast(field.get(sorter));
+  }
+
   private FetchHandler mockFetchHandler(FileInfo fileInfo) {
+    return mockFetchHandler(fileInfo, null);
+  }
+
+  private FetchHandler mockFetchHandler(
+      FileInfo fileInfo, PartitionFilesSorter partitionFilesSorter) {
     WorkerSource workerSource = mock(WorkerSource.class);
     TransportConf transportConf =
         Utils.fromCelebornConf(conf, TransportModuleConstants.FETCH_MODULE, 4);
     FetchHandler fetchHandler0 = new FetchHandler(conf, transportConf, workerSource);
     Worker worker = mock(Worker.class);
-    PartitionFilesSorter partitionFilesSorter =
-        new PartitionFilesSorter(MemoryManager.instance(), conf, workerSource);
+    if (partitionFilesSorter == null) {
+      partitionFilesSorter = new PartitionFilesSorter(MemoryManager.instance(), conf, workerSource);
+    }
 
     StorageManager storageManager = mock(StorageManager.class);
     Mockito.doReturn(storageManager).when(worker).storageManager();
